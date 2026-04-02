@@ -1,0 +1,150 @@
+name: QEMU with Web VNC (Inferno OS)
+
+on:
+  workflow_dispatch:          # 允许手动触发
+  push:
+    branches: [ master ]
+  pull_request:
+
+jobs:
+  # 复用已有的 Linux 构建产物（如需完整构建可取消注释 build_linux 依赖）
+  vnc_access:
+    name: Start VM with VNC + Cloudflare Tunnel
+    runs-on: ubuntu-24.04
+    needs: [build_linux]      # 确保先完成 QEMU 构建，如果不想依赖可直接在此 job 中构建
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 若不需要依赖之前的 build job，可在此重新构建 QEMU（较耗时）
+      # 这里演示直接下载已构建的 QEMU 二进制
+      - name: Download QEMU binaries (Linux)
+        uses: actions/download-artifact@v4
+        with:
+          name: linux
+          path: ./qemu-install
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libglib2.0-0 libpixman-1-0 libslirp0 libaio1 libcapstone4 \
+            libjpeg-turbo8 libpng16-16 libsasl2-2 libssh-4 libusb-1.0-0 \
+            liblzo2-2 libsnappy1v5 libzstd1 libgnutls30 \
+            python3 python3-pip git wget xz-utils
+          pip3 install websockify
+
+      - name: Setup noVNC
+        run: |
+          git clone --depth 1 https://github.com/novnc/noVNC.git
+          git clone --depth 1 https://github.com/novnc/websockify.git
+          # 将 websockify 加入 PATH
+          export PATH="$PWD/websockify:$PATH"
+
+      - name: Download Inferno OS (ARM64)
+        run: |
+          # 从官方镜像获取 Inferno 操作系统内核与 initrd (适用于 aarch64)
+          # 参考：https://chefkiss.dev/guides/inferno/
+          wget -q https://cdn.rawgit.com/lyang/Inferno-ARM-bin/master/kernel -O inferno-kernel
+          wget -q https://cdn.rawgit.com/lyang/Inferno-ARM-bin/master/initrd -O inferno-initrd
+          # 若上述链接失效，可使用备用方案或手动提供镜像地址
+          ls -lh inferno-kernel inferno-initrd
+
+      - name: Setup Cloudflare Tunnel (cloudflared)
+        run: |
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared-linux-amd64
+          sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
+
+      - name: Launch QEMU, noVNC and Cloudflare Tunnel
+        run: |
+          set -x
+          QEMU_BIN="$PWD/qemu-install/usr/local/bin/qemu-system-aarch64"
+          chmod +x "$QEMU_BIN"
+
+          # 准备 VNC 端口 5900，websockify 将 8080 转发到 5900
+          # 启动 QEMU (带 VNC 服务器，后台运行)
+          "$QEMU_BIN" \
+            -M virt -cpu cortex-a72 -m 1G \
+            -kernel inferno-kernel -initrd inferno-initrd \
+            -append "root=/dev/ram console=ttyAMA0" \
+            -vnc :0 -serial mon:stdio \
+            -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+            -daemonize
+
+          # 等待 VNC 端口就绪
+          sleep 5
+
+          # 启动 websockify (将 VNC 转换为 WebSocket，并托管 noVNC 页面)
+          nohup python3 -m websockify --web ./noVNC 8080 localhost:5900 > websockify.log 2>&1 &
+          sleep 3
+
+          # 启动 cloudflared 隧道，暴露本地 8080 端口
+          nohup cloudflared tunnel --url http://localhost:8080 > cloudflared.log 2>&1 &
+          sleep 8
+
+          # 提取 cloudflared 生成的随机域名
+          CLOUDFLARE_URL=$(grep -o 'https://[a-z0-9]*\.trycloudflare\.com' cloudflared.log | head -1)
+          if [ -z "$CLOUDFLARE_URL" ]; then
+            echo "::error::无法从 cloudflared 日志中提取域名"
+            cat cloudflared.log
+            exit 1
+          fi
+
+          echo "=========================================="
+          echo "✅ VNC 网页访问地址: $CLOUDFLARE_URL/vnc.html"
+          echo "=========================================="
+          echo "VNC_URL=$CLOUDFLARE_URL/vnc.html" >> $GITHUB_ENV
+
+          # 保持 Job 运行，直到手动取消 (以便持续访问)
+          echo "⏳ 服务已启动，按 Ctrl+C 或取消工作流即可停止"
+          while true; do sleep 60; done
+
+      - name: (Cleanup) - 可选：记录日志
+        if: always()
+        run: |
+          echo "=== websockify 日志 ==="
+          cat websockify.log 2>/dev/null || true
+          echo "=== cloudflared 日志 ==="
+          cat cloudflared.log 2>/dev/null || true
+
+  # 原有的构建 jobs (保留并作为依赖)
+  build_linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libtool meson ninja-build pkg-config libcapstone-dev device-tree-compiler libglib2.0-dev gnutls-bin libjpeg-turbo8-dev libpng-dev libslirp-dev libssh-dev libusb-1.0-0-dev liblzo2-dev libncurses5-dev libpixman-1-dev libsnappy-dev vde2 zstd libgnutls28-dev libgmp10 libgmp3-dev lzfse liblzfse-dev
+      - name: Build nettle 3.10.1
+        run: |
+          wget https://ftp.gnu.org/gnu/nettle/nettle-3.10.1.tar.gz
+          tar -xvf nettle-3.10.1.tar.gz
+          cd nettle-3.10.1
+          ./configure
+          make -j$(nproc)
+          sudo make install
+      - name: Build
+        run: |
+          mkdir build
+          cd build
+          PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig ../configure --target-list=aarch64-softmmu,x86_64-softmmu --enable-capstone --enable-slirp --enable-lzfse --enable-nettle --enable-gnutls --disable-werror
+          make -j$(nproc)
+      - name: Install
+        run: |
+          cd build
+          make DESTDIR=$GITHUB_WORKSPACE/bin/ install
+      - name: Publish binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: ${{ github.workspace }}/bin/
+
+  # 其余 macOS 构建 job 可选择性保留，此处为简洁省略（按需添加）
+  # build_macos: ...
+  # build_macos_x86_64: ...
