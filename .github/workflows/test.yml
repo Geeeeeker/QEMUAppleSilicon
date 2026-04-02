@@ -1,11 +1,28 @@
-# .github/workflows/build-amd64.yml
-name: Build QEMU for amd64 (x86_64) platforms
+# .github/workflows/build-amd64-manual.yml
+name: Build QEMU for amd64 (manual platform selection)
 
 on:
-  workflow_dispatch:          # 手动触发
-  push:
-    branches: [ master ]
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_linux:
+        description: 'Build for Linux (x86_64)'
+        required: false
+        default: true
+        type: boolean
+      build_windows:
+        description: 'Build for Windows (x86_64)'
+        required: false
+        default: true
+        type: boolean
+      build_macos:
+        description: 'Build for macOS (x86_64)'
+        required: false
+        default: true
+        type: boolean
+      release_tag:
+        description: 'Release tag to upload artifacts (e.g. v1.0.0). Leave empty to skip.'
+        required: false
+        type: string
 
 env:
   QEMU_SOURCE_REPO: 'Geeeeeker/QEMUAppleSilicon'
@@ -16,6 +33,8 @@ jobs:
   build-linux-amd64:
     name: Linux x86_64
     runs-on: ubuntu-24.04
+    if: github.event.inputs.build_linux == 'true'
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,7 +65,7 @@ jobs:
             --enable-capstone --enable-slirp --enable-lzfse --enable-nettle --enable-gnutls \
             --disable-werror
           make -j$(nproc)
-      - name: Install to temp and package
+      - name: Package
         run: |
           cd build
           make DESTDIR=${{ runner.temp }}/qemu-install install
@@ -62,6 +81,8 @@ jobs:
   build-macos-amd64:
     name: macOS x86_64
     runs-on: macos-13
+    if: github.event.inputs.build_macos == 'true'
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
@@ -84,7 +105,7 @@ jobs:
             --extra-cflags="-DNCURSES_WIDECHAR=1" \
             --disable-werror
           make -j$(sysctl -n hw.logicalcpu)
-      - name: Install and package
+      - name: Package
         run: |
           cd build
           make DESTDIR=${{ runner.temp }}/qemu-install install
@@ -96,10 +117,12 @@ jobs:
           name: qemu-macos-amd64
           path: qemu-macos-amd64.zip
 
-  # Windows x86_64 (MSYS2)
+  # Windows x86_64 (使用 MSYS2，优化稳定性)
   build-windows-amd64:
     name: Windows x86_64
     runs-on: windows-latest
+    if: github.event.inputs.build_windows == 'true'
+    timeout-minutes: 180
     defaults:
       run:
         shell: msys2 {0}
@@ -108,10 +131,11 @@ jobs:
         with:
           repository: ${{ env.QEMU_SOURCE_REPO }}
           fetch-depth: 0
-      - uses: msys2/setup-msys2@v2
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-          update: true
+          update: false          # 跳过系统更新，避免长时间等待或失败
           install: >-
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-libtool
@@ -140,7 +164,7 @@ jobs:
             --enable-capstone --enable-slirp --enable-lzfse --enable-gnutls \
             --disable-werror
           make -j$(nproc)
-      - name: Install and package
+      - name: Package
         run: |
           cd build
           make DESTDIR="$RUNNER_TEMP/qemu-install" install
@@ -152,11 +176,11 @@ jobs:
           name: qemu-windows-amd64
           path: qemu-windows-amd64.zip
 
-  # 上传到 Release (手动指定 tag)
+  # 上传到 GitHub Release（可选）
   upload-to-release:
-    name: Upload amd64 artifacts to Release
-    needs: [build-linux-amd64, build-macos-amd64, build-windows-amd64]
-    if: github.event_name == 'workflow_dispatch' && github.ref_type == 'tag'
+    name: Upload to Release
+    needs: [build-linux-amd64, build-windows-amd64, build-macos-amd64]
+    if: github.event.inputs.release_tag != ''
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -165,11 +189,11 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: ./artifacts
-      - name: Create Release and upload assets
+      - name: Create Release and upload
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Release ${{ github.ref_name }}
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: Release ${{ github.event.inputs.release_tag }}
           draft: false
           prerelease: false
           files: ./artifacts/**/*.zip
