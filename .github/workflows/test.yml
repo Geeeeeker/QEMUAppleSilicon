@@ -1,5 +1,5 @@
 # .github/workflows/build-amd64-manual.yml
-name: Build QEMU for amd64 (manual platform selection)
+name: Build QEMU for amd64 (with libimobiledevice)
 
 on:
   workflow_dispatch:
@@ -29,7 +29,7 @@ env:
   TARGET_LIST: 'aarch64-softmmu,arm-softmmu,x86_64-softmmu'
 
 jobs:
-  # Linux x86_64
+  # ---------- Linux x86_64 ----------
   build-linux-amd64:
     name: Linux x86_64
     runs-on: ubuntu-24.04
@@ -48,7 +48,8 @@ jobs:
             device-tree-compiler libglib2.0-dev gnutls-bin libjpeg-turbo8-dev \
             libpng-dev libslirp-dev libssh-dev libusb-1.0-0-dev liblzo2-dev \
             libncurses5-dev libpixman-1-dev libsnappy-dev vde2 zstd libgnutls28-dev \
-            libgmp10 libgmp3-dev lzfse liblzfse-dev
+            libgmp10 libgmp3-dev lzfse liblzfse-dev \
+            libusb-1.0-0-dev libplist-dev libusbmuxd-dev libimobiledevice-dev
       - name: Build nettle
         run: |
           wget https://ftp.gnu.org/gnu/nettle/nettle-3.10.1.tar.gz
@@ -57,13 +58,13 @@ jobs:
           ./configure
           make -j$(nproc)
           sudo make install
-      - name: Configure and build
+      - name: Configure and build QEMU
         run: |
           mkdir build && cd build
           PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig \
           ../configure --target-list=${{ env.TARGET_LIST }} \
             --enable-capstone --enable-slirp --enable-lzfse --enable-nettle --enable-gnutls \
-            --disable-werror
+            --enable-usb-redir --enable-libusb --disable-werror
           make -j$(nproc)
       - name: Package
         run: |
@@ -77,7 +78,7 @@ jobs:
           name: qemu-linux-amd64
           path: qemu-linux-amd64.zip
 
-  # macOS x86_64
+  # ---------- macOS x86_64 ----------
   build-macos-amd64:
     name: macOS x86_64
     runs-on: macos-13
@@ -92,8 +93,8 @@ jobs:
         run: |
           brew install libtool meson ninja pkgconf capstone dtc glib gnutls \
             jpeg-turbo libpng libslirp libssh libusb lzo ncurses nettle pixman \
-            snappy vde zstd lzfse
-      - name: Configure and build
+            snappy vde zstd lzfse libplist libusbmuxd libimobiledevice
+      - name: Configure and build QEMU
         run: |
           mkdir build && cd build
           LIBTOOL="glibtool" ../configure \
@@ -102,6 +103,7 @@ jobs:
             --enable-lzfse --enable-slirp --enable-capstone --enable-curses \
             --enable-libssh --enable-virtfs --enable-zstd \
             --disable-sdl --disable-gtk --enable-cocoa \
+            --enable-usb-redir --enable-libusb \
             --extra-cflags="-DNCURSES_WIDECHAR=1" \
             --disable-werror
           make -j$(sysctl -n hw.logicalcpu)
@@ -117,7 +119,7 @@ jobs:
           name: qemu-macos-amd64
           path: qemu-macos-amd64.zip
 
-  # Windows x86_64 (使用 MSYS2，优化稳定性)
+  # ---------- Windows x86_64 (MSYS2 + 源码编译 lzfse & libimobiledevice) ----------
   build-windows-amd64:
     name: Windows x86_64
     runs-on: windows-latest
@@ -131,11 +133,11 @@ jobs:
         with:
           repository: ${{ env.QEMU_SOURCE_REPO }}
           fetch-depth: 0
-      - name: Setup MSYS2
+      - name: Setup MSYS2 (minimal)
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-          update: false          # 跳过系统更新，避免长时间等待或失败
+          update: false
           install: >-
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-libtool
@@ -155,13 +157,54 @@ jobs:
             mingw-w64-x86_64-pixman
             mingw-w64-x86_64-snappy
             mingw-w64-x86_64-zstd
-            mingw-w64-x86_64-lzfse
             make
-      - name: Configure and build
+            git
+            automake
+            autoconf
+            libtool
+      - name: Build lzfse from source (MSYS2)
+        run: |
+          git clone https://github.com/lzfse/lzfse.git
+          cd lzfse
+          make
+          make install PREFIX=/mingw64
+      - name: Build libplist (MSYS2)
+        run: |
+          git clone https://github.com/libimobiledevice/libplist.git
+          cd libplist
+          ./autogen.sh --prefix=/mingw64 --without-cython
+          make -j$(nproc)
+          make install
+      - name: Build libusbmuxd (MSYS2)
+        run: |
+          git clone https://github.com/libimobiledevice/libusbmuxd.git
+          cd libusbmuxd
+          ./autogen.sh --prefix=/mingw64
+          make -j$(nproc)
+          make install
+      - name: Build libimobiledevice (MSYS2)
+        run: |
+          git clone https://github.com/libimobiledevice/libimobiledevice.git
+          cd libimobiledevice
+          ./autogen.sh --prefix=/mingw64 --without-cython --enable-debug
+          make -j$(nproc)
+          make install
+      - name: Build libirecovery (optional, for recovery mode)
+        run: |
+          git clone https://github.com/libimobiledevice/libirecovery.git
+          cd libirecovery
+          ./autogen.sh --prefix=/mingw64
+          make -j$(nproc)
+          make install
+      - name: Configure and build QEMU
         run: |
           mkdir build && cd build
+          PKG_CONFIG_PATH=/mingw64/lib/pkgconfig \
           ../configure --target-list=${{ env.TARGET_LIST }} \
             --enable-capstone --enable-slirp --enable-lzfse --enable-gnutls \
+            --enable-usb-redir --enable-libusb \
+            --extra-cflags="-I/mingw64/include" \
+            --extra-ldflags="-L/mingw64/lib" \
             --disable-werror
           make -j$(nproc)
       - name: Package
@@ -176,7 +219,7 @@ jobs:
           name: qemu-windows-amd64
           path: qemu-windows-amd64.zip
 
-  # 上传到 GitHub Release（可选）
+  # ---------- 上传到 Release ----------
   upload-to-release:
     name: Upload to Release
     needs: [build-linux-amd64, build-windows-amd64, build-macos-amd64]
